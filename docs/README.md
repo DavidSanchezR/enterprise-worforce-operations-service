@@ -60,6 +60,7 @@ El **stack está verificado** en el repositorio (.NET 10, EF Core 10, SQL Server
 | Archivo | Consultar cuando |
 |---|---|
 | [integracion/informe-brechas-eac-vs-comedores.md](integracion/informe-brechas-eac-vs-comedores.md) | Antes de diseñar o tocar código: qué existe en EAC, qué falta frente al punto 8 y qué decisiones siguen abiertas |
+| [integracion/linea-base.md](integracion/linea-base.md) | Estado real verificado del repositorio: compilación, pruebas y pantallas. Leer antes de retomar el proyecto |
 | [integracion/orden-de-ejecucion.md](integracion/orden-de-ejecucion.md) | Siempre que se pregunte qué sigue: fases, puntos de control, decisiones y cuándo abrir VS Code |
 | [integracion/prompts-de-arranque.md](integracion/prompts-de-arranque.md) | Al empezar a trabajar con Claude Code: secuencia de prompts con entradas, restricciones y criterio de terminado |
 | [integracion/prompts-migracion-pantallas.md](integracion/prompts-migracion-pantallas.md) | Al migrar pantallas de React a Blazor: piloto, prompt repetible por grupo, verificación y retiro |
