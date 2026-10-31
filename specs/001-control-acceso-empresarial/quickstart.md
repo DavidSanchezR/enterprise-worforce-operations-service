@@ -1,0 +1,483 @@
+# Quickstart — Validación de Control de Acceso Empresarial
+
+Guía de validación end-to-end para comprobar que la funcionalidad implementada cumple las historias P1 y
+CS-009. No incluye código de implementación (modelos, servicios, migraciones); esos artefactos se generan
+en las fases de `tasks.md` e implementación. Referencia los contratos en [`contracts/`](./contracts/) y las
+entidades en [`data-model.md`](./data-model.md).
+
+## Prerrequisitos
+
+- .NET 10 SDK
+- Node.js LTS (20+) y npm
+- Docker Desktop (o motor Docker compatible) — requerido por `Testcontainers.MsSql` en las pruebas de
+  integración, y para levantar SQL Server local de desarrollo (imagen `mcr.microsoft.com/mssql/server`,
+  stack ratificado en la Sesión 2026-09-14 "Stack Tecnológico Oficial" — reemplaza PostgreSQL)
+
+## 1. Levantar dependencias locales
+
+```bash
+docker run --name eac-sqlserver -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=Dev-Password1!" \
+  -p 1433:1433 -d mcr.microsoft.com/mssql/server:2022-latest
+```
+
+No se requiere ninguna extensión adicional: el mecanismo de no-solapamiento de vigencia se implementa con un
+trigger `AFTER INSERT, UPDATE` por tabla, aplicado como parte de las migraciones de EF Core (research.md §5)
+— no como una extensión de servidor que deba habilitarse manualmente.
+
+## 2. Backend: restaurar, migrar y ejecutar
+
+El primer arranque crea automáticamente el administrador inicial (RF-078) y exige `Bootstrap__AdminPassword`
+por variable de entorno: no existe ningún valor por defecto en `appsettings.json` ni en
+`appsettings.Development.json`, y la API no arranca sin ella.
+
+```bash
+cd backend
+dotnet restore
+export Bootstrap__AdminPassword='<contraseña-que-cumpla-la-política-de-contraseñas>'
+dotnet ef database update --project src/EnterpriseAccessControl.Infrastructure \
+  --startup-project src/EnterpriseAccessControl.Api
+dotnet run --project src/EnterpriseAccessControl.Api
+```
+
+Verificación esperada: la API expone el documento OpenAPI generado en `/openapi/v1.json` (generador nativo
+`Microsoft.AspNetCore.OpenApi`, research.md §10) y debe ser consistente con los archivos publicados en
+`contracts/` (validado formalmente por `ContractTests`, paso 4); `GET /health/live` y `GET /health/ready`
+responden `200` (research.md §19).
+
+## 3. Frontend: instalar y ejecutar
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Verificación esperada: la SPA carga en el navegador y la pantalla de login llama a
+`POST /api/auth/login` (ver [`contracts/auth.yaml`](./contracts/auth.yaml)). La SPA llama a la API en su
+mismo origen: el servidor de Vite reenvía `/api` y `/health` a `VITE_API_PROXY_TARGET` (por defecto
+`http://localhost:5290`, la API de `dotnet run`; `http://localhost:8080` si la API corre con
+`docker compose`), así que la API no necesita CORS.
+
+## 4. Ejecutar la suite de pruebas automatizadas
+
+```bash
+# Backend: unitarias + integración (requiere Docker activo) + contrato
+cd backend
+dotnet test tests/EnterpriseAccessControl.UnitTests
+dotnet test tests/EnterpriseAccessControl.IntegrationTests
+dotnet test tests/EnterpriseAccessControl.ContractTests
+
+# Frontend: unitarias/componentes + end-to-end
+cd ../frontend
+npm run test        # Vitest
+npm run test:e2e     # Playwright
+```
+
+Cobertura mínima esperada (Principio VII, CS-008): cada historia P1 tiene al menos una prueba automatizada
+que la verifica de forma independiente, con casos explícitos de denegación por defecto, ciclos jerárquicos,
+solapamientos temporales inválidos y fuga de datos entre compañías.
+
+## 5. Escenario de validación manual — CS-009
+
+Reproduce el criterio de éxito CS-009 ("un usuario debe poder crear una jerarquía de tres niveles y
+configurar un permiso horario") usando la API documentada en `contracts/`:
+
+1. **Login** — `POST /api/auth/login` con un usuario `ACTIVO` cuyo alcance incluya al menos una compañía.
+   *(Actualizado en la Sesión 2026-09-20, RF-078: el primer administrador ya no se crea a mano.)* El primer
+   arranque de la API crea automáticamente, si no existe ninguno, un usuario con rol `GLOBAL_ADMINISTRATOR`
+   tomando su correo de `Bootstrap:AdminEmail` y su contraseña de `Bootstrap:AdminPassword` (variable de
+   entorno `Bootstrap__AdminPassword` si no hay gestor de secretos; nunca un valor versionado en el
+   repositorio). La rutina es idempotente: reiniciar la API no crea un segundo administrador.
+
+   Ese primer login devuelve `requiereCambioPassword = true`, de modo que el siguiente paso obligatorio es
+   `POST /api/auth/cambiar-password` con una contraseña que cumpla la política vigente; recién después se
+   continúa con el escenario. Verificar también que la respuesta del login indique el rol
+   `GLOBAL_ADMINISTRATOR` (alcance global, sin compañías enumeradas). La automatización E2E de esta
+   sección —T159— aprovisiona su propio usuario en la preparación, sin depender de esta rutina.
+2. **Compañía Principal** — `POST /api/companias` con `tipoCompania = PRINCIPAL_MANDANTE` y `estado =
+   ACTIVO` (RF-042). *(Actualizado en la Sesión 2026-09-20: el alcance administrativo se expresa mediante
+   `AsignaciónRolAdministrativo`, no mediante una lista plana de compañías — RF-074 a RF-077.)* Si se continúa
+   con el administrador del paso 1, no hace falta ninguna acción: su rol `GLOBAL_ADMINISTRATOR` tiene alcance
+   sobre todas las compañías, incluidas las creadas después de su asignación (RF-074, RF-077). Para ejecutar
+   el resto del escenario como `COMPANY_ADMINISTRATOR` de esta compañía, crear la asignación con
+   `POST /api/usuarios/{id}/roles` —`rol = COMPANY_ADMINISTRATOR`, `companiaId` = la compañía recién creada, y
+   `fechaHoraInicio`/`fechaHoraFin` reales y obligatorias (RF-075)— e iniciar sesión de nuevo, porque el
+   alcance viaja en el token (RF-005, RF-077).
+3. **Jerarquía de 3 niveles de áreas de acceso** — `POST /api/areas-acceso` tres veces encadenadas:
+   - Nivel 1 (raíz): `areaSuperiorId = null`, `companiaPrincipalId` = ID de la Compañía Principal del
+     paso 2 (RF-046).
+   - Nivel 2: `areaSuperiorId` = ID del nivel 1 (hereda `companiaPrincipalId`).
+   - Nivel 3: `areaSuperiorId` = ID del nivel 2 (hereda `companiaPrincipalId`).
+   Verificar con `GET /api/areas-acceso/arbol?companiaPrincipalId={id}` que los tres nodos aparecen
+   anidados correctamente.
+4. **Prueba de rechazo de ciclo** — intentar `POST /api/areas-acceso/{nivel1Id}/mover` con
+   `nuevoPadreId = nivel3Id`. Debe responder `409` (RF-038, Principio V).
+5. **Tipo de persona y persona** — crear un `TipoPersona` (`POST /api/maestros/tipos-persona`), una
+   `Persona` (`POST /api/personas`) con todos los campos obligatorios de Historia 4, y asignarle el perfil
+   (`POST /api/personas/{id}/perfiles`, con `fechaHoraInicio`/`fechaHoraFin` reales — RF-071) y una compañía
+   vigente (`POST /api/personas/{id}/historial-companias`) apuntando a la Compañía Principal del paso 2, con
+   `fechaHoraInicio`/`fechaHoraFin` reales y obligatorias (p. ej. `fechaHoraInicio` = ahora,
+   `fechaHoraFin` = ahora + 1 año — RF-071; ya no admite `null` ni fecha centinela). Esta ventana es la
+   referencia de contención para los pasos 7 y 9 (RF-072). **[Post-Baseline VF-007, RF-082]**: registrar
+   primero la compañía y después el perfil. El perfil también queda contenido en esta ventana, así que sin
+   pertenencia vigente su alta responde `400 SIN_PERTENENCIA_VIGENTE`.
+6. **Autorizar el tipo de persona en el área de nivel 3** —
+   `PUT /api/areas-acceso/{nivel3Id}/tipos-persona` incluyendo el `TipoPersona` creado.
+7. **Contexto operativo** — `POST /api/personas/{id}/contextos-operativos` con `companiaPrincipalId` = la
+   Compañía Principal del paso 2 y `fechaHoraInicio`/`fechaHoraFin` reales, contenidas dentro de la vigencia
+   de la pertenencia del paso 5 (RF-072; p. ej. la misma ventana de un año). Como la persona pertenece
+   directamente a esa Principal, la asignación se acepta automáticamente sin necesitar relación
+   Contratista↔Principal (RF-053). **Este paso es obligatorio incluso para un permiso de alcance PERSONA**:
+   el algoritmo de evaluación de 14 pasos exige un contexto operativo vigente con la Principal propietaria
+   del área, y una credencial vigente con esa misma Principal (paso 9), antes de evaluar cualquier permiso
+   (RF-059, RF-066, research.md §7).
+8. **Permiso con bloque horario** — `POST /api/permisos` con `alcance = PERSONA`, `personaId` de la
+   persona creada, `areaAccesoId` del nivel 3, `fechaInicioVigencia`/`fechaFinVigencia` reales y
+   obligatorias (fechas civiles `AAAA-MM-DD` desde `permissions.yaml` v2.0.0, RF-083) que cubran el día de hoy
+   en `America/Lima` y queden dentro de las fechas de la pertenencia (RF-021, RF-071, RF-082), y un
+   `bloqueHorario` que cubra el día de semana y hora actuales en `America/Lima`.
+9. **Tipo de credencial y asignación** — crear un `TipoCredencial` (`POST /api/maestros/tipos-credencial`)
+   con `estado = ACTIVO`, y asignarlo a la persona para la Compañía Principal del paso 2
+   (`POST /api/personas/{id}/credenciales`) con `fechaHoraInicio`/`fechaHoraFin` reales, contenidas dentro
+   de la vigencia de la pertenencia del paso 5 (RF-072). **Este paso es obligatorio para que el paso 10
+   conceda acceso**: la evaluación exige una `AsignacionCredencial` vigente (`Estado = ASIGNADO`, dentro de
+   su ventana) para la Principal evaluada, además de los permisos — es condición necesaria, no suficiente
+   (RF-066, RF-070, RF-071).
+10. **Evaluar acceso** — `POST /api/evaluacion-acceso` con esa persona, esa área y la fecha/hora actual.
+    Resultado esperado: `resultado = CONCEDIDO`, `nivelAplicado = PERSONA`,
+    `contextoOperativoId` = el creado en el paso 7.
+11. **Prueba de denegación por defecto** — repetir el paso 10 con una `fechaHora` fuera del bloque horario
+    configurado. Resultado esperado: `resultado = DENEGADO`,
+    `motivoDenegacion = FUERA_DE_BLOQUE_HORARIO`.
+12. **Prueba de aislamiento entre compañías** — con un segundo usuario cuyo `alcanceCompanias` NO incluye la
+    compañía creada en el paso 2, repetir `GET /api/personas/{id}` de la persona creada. Resultado esperado:
+    `404` (RF-005, Historia 1 criterio 4).
+
+Si los 12 pasos producen los resultados esperados, la funcionalidad cumple CS-001 (implícito en el paso 1),
+CS-003 (medir latencia del paso 10), CS-006 (paso 4), CS-009 (pasos 3–10), CS-020 (paso 7), CS-022 (paso 9,
+credencial requiere Compañía Principal y TipoCredencial), CS-031 (paso 9, gate de credencial) y el criterio
+de aislamiento por compañía del Principio I (paso 12).
+
+## 6. Escenario adicional — Contexto Operativo multi-Principal (Pedro García / Servicios ACME)
+
+Reproduce el ejemplo completo de la corrección Contexto Operativo (RF-051 a RF-060; Historia 2, Historia 5,
+Historia 9): una persona de una Compañía Contratista trabajando **simultáneamente** para dos Compañías
+Principales distintas, cada una con su propia unidad organizativa, permiso y credencial independientes.
+Usa la Compañía Principal ("Minera ABC") y la jerarquía de áreas creadas en la sección 5.
+
+1. **Unidad organizativa raíz de Minera ABC** — `POST /api/unidades-organizativas` con
+   `unidadSuperiorId = null` y `companiaPrincipalId` = ID de Minera ABC (paso 2 de la sección 5). Verificar
+   con `GET /api/unidades-organizativas/arbol?companiaPrincipalId={id}` que aparece como raíz (RF-045).
+2. **Segunda Compañía Principal ("Minera XYZ"), con su propia unidad raíz** — `POST /api/companias` con
+   `tipoCompania = PRINCIPAL_MANDANTE`, y `POST /api/unidades-organizativas` con una unidad raíz propia.
+   Verificar que `GET /api/unidades-organizativas/arbol?companiaPrincipalId={idMineraXYZ}` NO incluye la
+   unidad de Minera ABC del paso 1 (CS-011: dos Principales nunca comparten unidades organizativas).
+3. **Área de acceso en Minera XYZ** — `POST /api/areas-acceso` con `companiaPrincipalId` = Minera XYZ (un
+   área raíz simple basta para este escenario), y autorizar en ella el `TipoPersona` creado en el paso 5 de
+   la sección 5 (`PUT /api/areas-acceso/{id}/tipos-persona` — RF-019, RF-024).
+4. **Compañía Contratista ("Servicios ACME")** — `POST /api/companias` con `tipoCompania = CONTRATISTA`.
+   Intentar `POST /api/unidades-organizativas` con `unidadSuperiorId = null` y `companiaPrincipalId`
+   apuntando a Servicios ACME. Resultado esperado: `400` (RF-045 — una Contratista no puede poseer unidades
+   organizativas).
+5. **Persona de la Contratista ("Pedro García")** — crear una `Persona`, asignarle como compañía vigente
+   Servicios ACME (`POST /api/personas/{id}/historial-companias`) con `fechaHoraInicio`/`fechaHoraFin`
+   reales y obligatorias (p. ej. `fechaHoraInicio` = ahora, `fechaHoraFin` = ahora + 1 año — RF-071; ya no
+   admite `null`). Esta ventana es la referencia de contención (RF-072) para los pasos 6, 8, 9 y 10.
+   Asignarle además el perfil de ese mismo `TipoPersona` (`POST /api/personas/{id}/perfiles`, con
+   `fechaHoraFin` obligatoria — RF-071; ~~el perfil no está sujeto a contención, RF-072~~ **[Post-Baseline
+   VF-007: desde RF-082 el perfil sí queda contenido en la pertenencia]**): el paso 8 del
+   algoritmo de evaluación exige un perfil vigente autorizado en el área antes de evaluar permisos (RF-024,
+   research.md §7).
+6. **Contexto operativo sin relación vigente — debe rechazarse** — intentar
+   `POST /api/personas/{id}/contextos-operativos` con `companiaPrincipalId` = Minera ABC y
+   `fechaHoraInicio`/`fechaHoraFin` dentro de la ventana del paso 5. Resultado esperado: `400` (RF-054 —
+   Servicios ACME todavía no tiene relación vigente con ninguna Principal; el rechazo es por esta razón, no
+   por fechas, que ya cumplen RF-072).
+7. **Relaciones Contratista↔Principal simultáneas** —
+   `POST /api/companias/{servicioAcmeId}/relaciones-principales` dos veces: una con `companiaPrincipalId`
+   = Minera ABC, otra con `companiaPrincipalId` = Minera XYZ, ambas con vigencia que cubra "ahora" (CS-012:
+   relaciones simultáneas con Principales distintas). `RelaciónContratistaPrincipal` no está vinculada a una
+   persona — su `fechaHoraFin` sigue siendo opcional (RF-071 no le aplica).
+8. **Dos contextos operativos simultáneos** — repetir el paso 6 (ahora debe aceptarse, `201`), y repetir
+   para Minera XYZ, ambos con `fechaHoraInicio`/`fechaHoraFin` contenidas en la ventana del paso 5 (RF-072).
+   Verificar con `GET /api/personas/{id}/contextos-operativos` que ambos contextos aparecen vigentes al
+   mismo tiempo (CS-013).
+9. **Unidad organizativa distinta por contexto** —
+   `POST /api/personas/{id}/contextos-operativos/{contextoAbcId}/unidad-organizativa` con la unidad de
+   Minera ABC del paso 1, y `POST .../{contextoXyzId}/unidad-organizativa` con la unidad de Minera XYZ del
+   paso 2 — ambas con `fechaHoraInicio`/`fechaHoraFin` reales, contenidas en la ventana del paso 5 (RF-071,
+   RF-072). Verificar con `GET /api/personas/{id}/estado-efectivo?fechaHora=ahora` que
+   `contextosOperativosVigentes` contiene dos entradas, cada una con su propia
+   `unidadOrganizativaVigenteId` (CS-014).
+10. **Permisos y credenciales independientes por Principal** — crear un `PermisoAcceso` de alcance
+    `UNIDAD_ORGANIZATIVA` sobre el área de Minera XYZ (paso 3) referenciando la unidad del contexto XYZ, con
+    `fechaHoraInicioVigencia`/`fechaHoraFinVigencia` reales y obligatorias (RF-021, RF-071) y un bloque
+    horario que cubra el día de semana y la hora actuales en `America/Lima` (RF-022); y dos
+    `AsignacionCredencial` para Pedro (previa creación de un `TipoCredencial` vía
+    `POST /api/maestros/tipos-credencial`) — una con `companiaPrincipalId` = Minera ABC, otra con
+    `companiaPrincipalId` = Minera XYZ, ambas `Estado = ASIGNADO` simultáneamente, con
+    `fechaHoraInicio`/`fechaHoraFin` reales contenidas en la ventana del paso 5 (RF-071, RF-072). Verificar
+    que ambas coexisten sin conflicto (CS-016, CS-017) y que cada una requirió su propio contexto operativo
+    vigente (RF-056).
+11. **Evaluar acceso al área de Minera XYZ** — `POST /api/evaluacion-acceso` con Pedro, el área del paso 3,
+    y la fecha/hora actual. Resultado esperado: `resultado = CONCEDIDO`, `nivelAplicado =
+    UNIDAD_ORGANIZATIVA`, `companiaPrincipalId` = Minera XYZ, `contextoOperativoId` = el contexto XYZ del
+    paso 8 — confirma que Pedro accede a través de su contexto operativo con Minera XYZ, no por ningún
+    vínculo implícito con Servicios ACME (RF-048, RF-059).
+12. **Aislamiento cruzado entre Principales** — `POST /api/evaluacion-acceso` con Pedro, un área
+    perteneciente a Minera ABC (nivel 3 de la sección 5) y la fecha/hora actual, sin haber creado ningún
+    permiso para Pedro en Minera ABC. Resultado esperado: `resultado = DENEGADO`,
+    `motivoDenegacion = SIN_PERMISO_APLICABLE` — el permiso creado en el paso 10 (contexto de Minera XYZ)
+    nunca se evalúa para un área de Minera ABC (CS-018).
+
+*(Sesión 2026-09-15: se añadieron al paso 3 la autorización del tipo de persona en el área, al paso 5 la
+asignación del perfil y al paso 10 el bloque horario. Sin ellos, los pasos 11 y 12 terminaban en
+`PERFIL_NO_AUTORIZADO_EN_AREA` —el paso 8 del algoritmo de 14 pasos se evalúa antes que los permisos— y el
+permiso del paso 10 era rechazado por no tener bloques. Es una corrección de la guía respecto de RF-022,
+RF-024 y research.md §7, sin cambio de reglas.)*
+
+Si los 12 pasos producen los resultados esperados, la funcionalidad cumple RF-043, RF-045, RF-047, RF-048,
+RF-051 a RF-060, RF-071 y RF-072 (fechas obligatorias y contención temporal en los pasos 5, 6, 8, 9 y 10), y
+el escenario de ejemplo completo de la corrección Contexto Operativo (Pedro García / Servicios ACME /
+Minera ABC / Minera XYZ).
+
+## 7. Escenarios de validación del cierre de Etapa 1 (Decisiones D1 a D9, Sesión 2026-09-20)
+
+Estos escenarios validan las correcciones planificadas en `research.md` §27-§33. **Implementados en la
+sesión del 2026-09-20** (tareas T169 a T228) y cubiertos por pruebas automatizadas, de modo que ejecutarlos
+a mano es una verificación de confirmación y no la única evidencia:
+
+| Escenario | Cobertura automatizada |
+|---|---|
+| 1 — Aislamiento administrativo (D1, D3) | `RolesAdministrativosTests` (CS-036, CS-037) |
+| 2 — Bootstrap (D2) | `RolesAdministrativosTests.CS038_*` |
+| 3 — Inactivación de Compañía (D4) | `CompaniaInactivaYZonaHorariaTests.CS039_*` |
+| 4 — Zona horaria por compañía (D5) | `CompaniaInactivaYZonaHorariaTests.CS040_*` |
+| 5 — Cambio de TipoCompania (D6) | `CambioTipoCompaniaTests` (CS-041) |
+| 6 — Interfaz de Historia 5 (D7) | `historia5-casos-a-b.spec.ts` (Playwright) |
+
+Referencian los mismos usuarios/compañías de las secciones 5 y 6 cuando sea posible.
+
+1. **Aislamiento administrativo (D1, D3 — cierra F-01/F-02)**: con un usuario `COMPANY_ADMINISTRATOR` cuya
+   única asignación de rol es sobre Minera ABC (sección 5), listar `GET /api/usuarios` — resultado esperado:
+   solo usuarios con alguna asignación vigente en Minera ABC, nunca la lista completa del sistema.
+   `POST /api/usuarios/{id}/roles` intentando asignar `GLOBAL_ADMINISTRATOR`, o `COMPANY_ADMINISTRATOR` para
+   Minera XYZ (sección 6) — resultado esperado: `403`. `PUT /api/unidades-organizativas/{id}` sobre una
+   unidad de Minera XYZ — resultado esperado: `404` (no `403`, para no confirmar existencia fuera de
+   alcance).
+2. **Bootstrap (D2)**: desde una base recién migrada, arrancar la API sin ningún `Usuario` existente —
+   resultado esperado: se crea automáticamente un único `Usuario` con `Rol = GLOBAL_ADMINISTRATOR`,
+   correo/contraseña provenientes de `Bootstrap:AdminEmail`/`Bootstrap:AdminPassword`,
+   `requiereCambioPassword = true`. Reiniciar la API — resultado esperado: no se crea un segundo Global
+   Administrator (idempotencia).
+3. **Inactivación de Compañía (D4)**: repetir el paso 10 de la sección 5 (evaluación `CONCEDIDO`) y luego
+   `PUT /api/companias/{id}` sobre Minera ABC con `estado = INACTIVO`; repetir la evaluación — resultado
+   esperado: `DENEGADO`, `motivoDenegacion = COMPANIA_INACTIVA`, sin que ningún contexto/UO/credencial de la
+   persona cambie de estado. Reactivar (`estado = ACTIVO`) y repetir — resultado esperado: `CONCEDIDO` de
+   nuevo, sin ninguna acción adicional.
+4. **Zona horaria por compañía (D5)**: configurar `zonaHorariaIana` distinta en Minera ABC y Minera XYZ
+   (sección 6, p. ej. `America/Lima` y `America/Santiago`); evaluar acceso a un área de cada una a la misma
+   `fechaHora` UTC, con bloques horarios que solo cubran la hora local de una de las dos zonas — resultado
+   esperado: `CONCEDIDO` en la que coincide con su hora local, `DENEGADO`/`FUERA_DE_BLOQUE_HORARIO` en la
+   otra, confirmando que cada Compañía Principal usa su propia zona.
+5. **Cambio de TipoCompania con dependientes (D6)**: intentar `PUT /api/companias/{id}` cambiando Minera ABC
+   (con áreas/UO ya creadas en la sección 5) a `CONTRATISTA` — resultado esperado: `409`,
+   `codigo = CAMBIO_TIPO_COMPANIA_CON_DEPENDENCIAS`. Repetir con una compañía recién creada sin dependientes
+   — resultado esperado: `200`, cambio aceptado en cualquier dirección.
+6. **Interfaz de Historia 5 (D7)**: desde la UI (no la API), para una persona de una Contratista sin
+   pertenencia previa, completar el wizard de asignación: crear pertenencia → Caso B, seleccionar Principal
+   entre las relaciones vigentes de su Contratista → abrir contexto → seleccionar unidad organizativa
+   mediante el árbol → asociar perfil — resultado esperado: los mismos efectos de dominio que crear cada
+   recurso por API (secciones 5 y 6), verificables con `GET /api/personas/{id}/estado-efectivo`.
+
+Decisiones sin escenario de validación funcional (no requieren uno): D8 (fuera de alcance de Etapa 1, sin
+funcionalidad que probar) y D9 (ratifican comportamiento ya cubierto por las suites existentes de política de
+contraseñas y de `CredencialService`).
+
+## 8. Escenarios de validación del cierre de desviaciones (D-1, D-2, D-4 — Sesión 2026-09-20)
+
+> Las etiquetas con guion (`D-1`, `D-2`, `D-4`) son las **desviaciones** detectadas al terminar T169–T228,
+> distintas de las decisiones `D1`–`D9` de la sección 7 pese a la coincidencia de letra (research.md §34).
+> `D-3` y `D-5` no tienen escenario: la primera se cerró como implementación válida sin cambios y la segunda
+> por configuración/documentación, ya verificable en la sección 2 (la API no arranca sin
+> `Bootstrap__AdminPassword`).
+
+Estos escenarios validan lo planificado en `research.md` §34. **Implementados en la sesión del 2026-09-20**
+(tareas T229 a T242) y cubiertos por pruebas automatizadas, de modo que ejecutarlos a mano es una
+verificación de confirmación y no la única evidencia:
+
+| Escenario | Cobertura automatizada |
+|---|---|
+| 1 — Renovación de asignación de rol (D-1) | `RolesAdministrativosTests.Renovar_*` (7 pruebas), `UsuarioDetalle.test.tsx`, `administracion-usuarios.spec.ts` |
+| 2 — Alcance GLOBAL vs COMPANY (D-2) | `AislamientoRecursosTests` (9 pruebas, los siete recursos de CS-037) |
+| 3 — Búsqueda server-side (D-4) | `BusquedaUsuariosTests` (7 pruebas), `UsuariosPage.test.tsx`, `administracion-usuarios.spec.ts` |
+
+1. **Renovación de una asignación de rol (D-1 — RF-075, RF-076, RF-077)**: con un `GLOBAL_ADMINISTRATOR`,
+   crear un usuario con una asignación vigente y renovarla con
+   `POST /api/usuarios/{id}/roles/{asignacionId}/renovar` y cuerpo `{ "fechaHoraFin": "<posterior>" }` —
+   resultado esperado: `204`, y `GET .../roles` devuelve la **misma** asignación (mismo `id`, mismo `rol`,
+   misma `companiaId`, misma `fechaHoraInicio`) con la nueva `fechaHoraFin`; nunca un registro adicional.
+   Repetir con una fecha anterior o igual a la vigente — resultado esperado: `409`,
+   `codigo = RENOVACION_NO_POSTERIOR`. Repetir sobre una asignación ya finalizada o ya expirada — resultado
+   esperado: `409`, `codigo = ASIGNACION_ROL_NO_VIGENTE`. Desde un `COMPANY_ADMINISTRATOR` de Minera ABC,
+   renovar una asignación de un usuario de Minera XYZ — resultado esperado: `404` (no `403`, para no
+   confirmar su existencia); y renovar una asignación `GLOBAL_ADMINISTRATOR` de un usuario que sí está en su
+   alcance — resultado esperado: `403`, `codigo = ROL_NO_AUTORIZADO`. Desde la interfaz, la acción
+   **Renovar** del detalle de usuario debe pedir confirmación igual que **Finalizar** (UX-20).
+2. **Alcance GLOBAL vs COMPANY en los siete recursos de CS-037 (D-2 y C2 — RF-077)**: con dos Principales
+   distintas (Minera ABC y Minera XYZ, secciones 5 y 6), operar con un `GLOBAL_ADMINISTRATOR` sobre recursos
+   de **ambas** en la misma sesión y repetir cada operación con un `COMPANY_ADMINISTRATOR` cuya única
+   asignación vigente es sobre Minera ABC, apuntando a recursos de Minera XYZ **cuyos identificadores se
+   conocen y son válidos** — resultado esperado: el global procede en las dos Principales sin enumerar
+   compañías en el token; el de compañía recibe `404` en todos los casos, nunca `403` ni una respuesta
+   parcial. Los siete recursos y su superficie real de autorización:
+
+   | Recurso | Superficie que se ejercita |
+   |---|---|
+   | Usuarios | `GET /api/usuarios/{id}` |
+   | Compañías | `GET /api/companias/{id}` y el listado paginado |
+   | Unidades organizativas | `GET` y `PUT /api/unidades-organizativas/{id}` |
+   | Áreas de acceso | `GET` y `PUT /api/areas-acceso/{id}` |
+   | Personas | `GET /api/personas/{id}` y su `historial-companias` |
+   | Contextos operativos | `GET .../contextos-operativos` y `POST .../{contextoId}/unidad-organizativa` |
+   | Credenciales | `GET`, `POST .../devolver` y `DELETE` bajo `/api/personas/{id}/credenciales` |
+
+   Además, dos servicios sin recurso propio: el **estado efectivo** (`GET .../estado-efectivo`, proyección de
+   la persona) y la **cascada de revocación**, que se ejercita vía
+   `POST /api/personas/{id}/historial-companias/{asignacionId}/finalizar` porque `RevocacionService` no tiene
+   endpoint propio ni control de alcance propio por diseño (research.md §34.2). En ese último caso se
+   comprueba además que la pertenencia ajena **no se modificó**: el `404` no puede ser cosmético.
+3. **Búsqueda server-side de usuarios (D-4 — RF-077, UX-22)**: con un `GLOBAL_ADMINISTRATOR` y más usuarios
+   que `tamañoPagina`, identificar un correo que **no** esté en la primera página y consultar
+   `GET /api/usuarios?texto=<fragmento-de-ese-correo>&pagina=1` — resultado esperado: el usuario aparece en
+   la página 1 del resultado filtrado, con `total` igual al número de coincidencias y no al de usuarios del
+   sistema. Combinar `texto` con `estado` — resultado esperado: se aplican ambos (AND). Buscar un fragmento
+   sin coincidencias — resultado esperado: `200` con `items: []` y `total: 0`, nunca `404`. Desde un
+   `COMPANY_ADMINISTRATOR` de Minera ABC, buscar el correo **exacto y conocido** de un usuario cuya única
+   asignación es de Minera XYZ — resultado esperado: `items: []` y `total: 0`, idéntico a buscar un correo
+   inexistente: conocer el correo no revela su existencia ni concede acceso. Desde la interfaz, escribir en
+   el filtro **Correo** debe encontrar al usuario de la página 3 sin navegar hasta ella.
+
+## 9. Escenarios de validación del cambio post-Baseline VF-007 (RF-082, Sesión 2026-09-25)
+
+> Cambio de requisito posterior al cierre del Baseline (research.md §35). **Implementado** en las tareas
+> T243–T266 (bloque POST-BASELINE — VF-007) y cubierto por pruebas automatizadas que ejercitan cada
+> escenario por HTTP contra la API y SQL Server reales, así que ejecutarlos a mano es una confirmación y
+> no la única evidencia. `OpenApiSnapshotTests`, que estuvo en rojo entre el plan y la implementación
+> (research.md §35.4), vuelve a verde desde T247/T248.
+
+| Escenario | Cobertura automatizada |
+|---|---|
+| 1 — Alta de perfil (CS-042) | `ContencionPerfilesTests` (7 pruebas), `ContencionTemporalTests.El_perfil_esta_sujeto_a_contencion_temporal_desde_RF_082` |
+| 2 — Alta de permiso y aislamiento (CS-042, C1) | `ContencionPermisosPersonaTests` (13 pruebas, incluidas las dos de aislamiento `404`) |
+| 3 — Registros anteriores a RF-082 (CS-043) | `RegistrosAnterioresRf082Tests` (11 pruebas), `ReglaContencionPermisoTests` (matriz D4) |
+| 4 — Renovación (RF-073) | `Rf082RenovacionYCascadaTests.Renovar_la_pertenencia_amplia_el_limite_...` |
+| 5 — Sin cambio en la cascada (D3) | `Rf082RenovacionYCascadaTests.Finalizar_la_pertenencia_no_revoca_...`, `PerfilesPersonaTests.Los_perfiles_no_se_revocan_al_cerrar_la_pertenencia` |
+| 6 — Interfaz | `PerfilesPersona.test.tsx`, `PermisosPage.test.tsx` (casos RF-082); E2E `cs009-quickstart` y `multi-principal-quickstart` |
+
+Preparación: una persona con una pertenencia vigente de `01/08/2026` a `31/07/2027` (fechas del ejemplo de
+CS-042; en la prueba real se usan fechas relativas al día actual), una segunda persona sin pertenencia, y un
+área de acceso de la Principal.
+
+1. **Alta de perfil (CS-042)**: `POST /api/personas/{id}/perfiles` con fin `31/03/2027` → `201`; con fin
+   `31/07/2027` → `201`; con fin `01/08/2027` → `409`, `codigo = FUERA_DE_CONTENCION_TEMPORAL`; con inicio
+   `01/07/2026` → `409`, mismo código. Sobre la persona sin pertenencia → `400`,
+   `codigo = SIN_PERTENENCIA_VIGENTE`.
+2. **Alta de permiso (CS-042)**: `POST /api/permisos` con `alcance = PERSONA` y las mismas combinaciones →
+   mismos resultados. Con `alcance = UNIDAD_ORGANIZATIVA` o `COMPANIA` y fechas fuera de la pertenencia →
+   `201`: la regla no les aplica. **Aislamiento**: un `COMPANY_ADMINISTRATOR` de la compañía A que administra
+   el área, sobre una persona cuyo único histórico es con la compañía B → `404`,
+   `codigo = RECURSO_NO_ENCONTRADO`, nunca `400`/`409`, sean cuales sean las fechas (research.md §35.6).
+3. **Registros anteriores a RF-082 (CS-043)**: insertar directamente en base de datos un perfil y un permiso
+   de alcance PERSONA que excedan la pertenencia, simulando datos creados bajo la regla anterior.
+   - `GET` los devuelve con sus fechas originales.
+   - `PUT` del permiso cambiando solo los bloques → `200`, fechas intactas.
+   - `PUT` a `INACTIVO` → `200`, también sobre la persona sin pertenencia.
+   - `PUT` de nuevo a `ACTIVO` → `409` (fuera de contención) o `400` (sin pertenencia).
+   - `PUT` que cambia las fechas a un rango que sigue fuera → `409`; a un rango contenido → `200`.
+4. **Renovación (RF-073)**: renovar la pertenencia hasta `31/01/2028`. Los perfiles y permisos existentes no
+   cambian. Un perfil nuevo con fin `31/01/2028` → `201`.
+5. **Sin cambio en la cascada**: finalizar la pertenencia. Los perfiles y permisos siguen `ACTIVO` con sus
+   fechas (RF-061 sin cambios). Solo se revocan el contexto, la unidad organizativa y la credencial.
+6. **Interfaz**: en el historial de la persona, el formulario de perfiles limita las fechas a la pertenencia
+   vigente y muestra un mensaje específico ante cada código. En el formulario de permisos, un rechazo por
+   contención muestra un mensaje específico y no un error genérico.
+
+> **Nota VF-004**: desde `permissions.yaml` v2.0.0, las peticiones de permisos de este apartado envían
+> `fechaInicioVigencia`/`fechaFinVigencia` (fechas civiles). Las fechas de CS-042 se comparan como fechas
+> civiles para el permiso (RF-083), así que los resultados esperados no cambian.
+
+## 10. Escenarios de validación del cambio post-Baseline VF-004 (RF-083, Sesión 2026-09-25)
+
+Vigencia del permiso en días civiles completos (spec.md RF-083, CS-044 a CS-047; research.md §36;
+`contracts/permissions.yaml` v2.0.0). Los mismos escenarios se cubren con pruebas automatizadas (ver
+plan.md, "Plan post-Baseline VF-004").
+
+> **Implementado** en las tareas T287–T312 (bloque POST-BASELINE — VF-004). Cada escenario tiene pruebas
+> automatizadas que lo ejercitan por HTTP contra la API y SQL Server reales, con fechas relativas al día de
+> ejecución. Las fechas de este apartado son ejemplos documentales, así que reproducirlos a mano es una
+> confirmación y no la única evidencia. `OpenApiSnapshotTests`, en rojo entre el plan y la implementación
+> (research.md §36.5), vuelve a verde con los DTO de T289/T293, y así lo verifica T302. La regresión dirigida de T310 demuestra que las pruebas
+> detectan por separado el día UTC en lugar del local, la contención por instantes y la pérdida de la
+> conservación por extremo.
+
+| Escenario | Cobertura automatizada |
+|---|---|
+| 1 — Alta diaria (CS-044) | `VigenciaDiariaPermisosTests` (persistencia exacta en Lima, lectura como fechas, último día concedido, día siguiente `PERMISO_FUERA_DE_VIGENCIA`, hora sin bloque `FUERA_DE_BLOQUE_HORARIO`); `VigenciaDiariaPermisoTests` (Lima) |
+| 2 — Un solo día y periodo inválido (CS-045) | `VigenciaDiariaPermisosTests` (un día; fin anterior → `400 PERIODO_INVALIDO`; contrato antiguo → `400` que nombra los campos nuevos; fecha con hora o mal formada → `400`); `PermisosTests` |
+| 3 — Mismo último día que la pertenencia (RF-082 por fecha civil) | `ContencionPermisoFechaCivilTests` (fin = último día en Lima e inicio = primer día en `Asia/Tokyo` → `201`; día siguiente o anterior → `409`; sin pertenencia → `400`; aislamiento `404`); `ContencionFechaCivilPermisoTests` |
+| 4 — Permiso anterior con hora (CS-046) e instantes invertidos | `PermisosHistoricosVigenciaDiariaTests` (lectura; solo bloques o estado; un solo extremo; `FinUtc <= InicioUtc` → `400 PERIODO_INVALIDO` sin modificar el permiso); `RegistrosAnterioresRf082Tests` |
+| 5 — Cambio de zona (CS-047) | `PermisosHistoricosVigenciaDiariaTests` (`POST` normalizado, cambio de zona por la API de compañías, filas sin cambios, lectura recalculada) |
+| 6 — Cambio de horario | `VigenciaDiariaPermisoTests` (Santiago: día sin 00:00 de 23 h y día de 25 h, localizados con tzdb; día omitido en `Pacific/Apia`); `VigenciaDiariaPermisosTests` (alta en Santiago el día sin 00:00) |
+| 7 — Interfaz | `PermisosPage.test.tsx` (controles `date`, listado con fechas o con fecha y hora en la zona de la Principal, nota del permiso con hora, reenvío de fechas, un día, fin anterior, límites por fecha declarada); `fechas.test.ts`; E2E `cs009-quickstart` y `multi-principal-quickstart` | Precondición común: una Compañía Principal con zona `America/Lima`, un
+área de nivel 3 de esa Principal y una persona con pertenencia vigente del 01/08/2026 al 31/07/2027, con
+contexto operativo, perfil autorizado y credencial vigentes.
+
+1. **Alta diaria (CS-044)**: `POST /api/permisos` con `alcance = PERSONA`, `fechaInicioVigencia = 2026-09-25`,
+   `fechaFinVigencia = 2026-09-30` y bloques que cubren todo el día → `201`. La respuesta trae
+   `fechaHoraInicioVigencia = 2026-09-25T05:00:00.000Z`, `fechaHoraFinVigencia = 2026-10-01T04:59:59.999Z`,
+   `fechaInicioVigencia = 2026-09-25`, `fechaFinVigencia = 2026-09-30`, `vigenciaEnDiasCompletos = true` y
+   `zonaHorariaIana = America/Lima`. La evaluación a las 23:00 de Lima del 30/09 da `CONCEDIDO`, y a las 00:30
+   del 01/10, `DENEGADO` con `PERMISO_FUERA_DE_VIGENCIA`. Dentro de la vigencia, una hora sin bloque da
+   `FUERA_DE_BLOQUE_HORARIO`.
+2. **Un solo día y periodo inválido (CS-045)**: inicio = fin → `201`; fin anterior al inicio → `400`. Una
+   petición con los campos antiguos `fechaHoraInicioVigencia`/`fechaHoraFinVigencia` → `400`, que nombra
+   `fechaInicioVigencia` y `fechaFinVigencia`.
+3. **Mismo último día que la pertenencia (RF-082 por fecha civil)**: `fechaFinVigencia = 2027-07-31` → `201`,
+   aunque su instante UTC (`2027-08-01T04:59:59.999Z`) sea posterior al de la pertenencia
+   (`2027-07-31T23:59:59.999Z`). `2027-08-01` → `409` `FUERA_DE_CONTENCION_TEMPORAL`.
+4. **Permiso anterior con hora (CS-046)**: insertar directamente en base de datos un permiso
+   `2026-09-25T08:00:00.000Z – 2026-09-30T17:00:00.000Z`.
+   - `GET` → mismos instantes, `fechaInicioVigencia = 2026-09-25`, `fechaFinVigencia = 2026-09-30`,
+     `vigenciaEnDiasCompletos = false`. La interfaz muestra 25/09/2026 03:00 – 30/09/2026 12:00.
+   - `PUT` que reenvía las mismas fechas y cambia solo bloques o estado → `200`, ambos instantes intactos.
+   - `PUT` con `fechaFinVigencia = 2026-10-05` → inicio intacto y fin `2026-10-06T04:59:59.999Z`.
+   - **Instantes invertidos (`FinUtc <= InicioUtc`)**: insertar otro permiso antiguo con fin exactamente
+     `2026-09-30T05:00:00.000Z` (00:00 de Lima del 30/09, así que su fecha civil de fin es 30/09) e inicio
+     anterior. Un `PUT` con `fechaInicioVigencia = 2026-09-30` y `fechaFinVigencia = 2026-09-30` pasa la
+     validación de fechas, pero al conservar el fin y normalizar el inicio (`2026-09-30T05:00:00.000Z`) resulta
+     `FinUtc <= InicioUtc` → `400`, `codigo = PERIODO_INVALIDO`. Un `GET` posterior devuelve el permiso con sus
+     instantes y su estado originales, sin ninguna modificación (RF-039, RF-083 (d)).
+5. **Cambio de zona (CS-047)**: cambiar la zona de la Principal a `America/Santiago`. Ningún instante cambia.
+   Las fechas civiles se recalculan y un permiso que deja de coincidir con los límites de día se devuelve con
+   `vigenciaEnDiasCompletos = false`.
+6. **Cambio de horario**: con una Principal en `America/Santiago`, un permiso que empieza el día en que el
+   reloj salta de 00:00 a 01:00 empieza en ese primer instante válido (01:00 local), y el día anterior termina
+   1 ms antes.
+7. **Interfaz**: el formulario de permisos usa controles de fecha. Al editar un permiso con hora se muestran
+   sus instantes actuales y se avisa de que se conservan si no cambia la fecha. El listado muestra solo fechas
+   cuando `vigenciaEnDiasCompletos = true`, y fecha y hora en la zona de la Principal cuando es `false`.
+
+## 11. Próximos pasos
+
+Este quickstart valida el comportamiento end-to-end una vez implementado. La secuencia de construcción
+(entidades → migraciones → casos de uso → endpoints → UI) se define en `tasks.md`, generado por el comando
+`/speckit-tasks` a partir de este plan. Las tareas de corrección del cierre de Etapa 1 (D1-D9) ya se
+generaron y completaron como T169–T228, sin renumerar T001–T168. Los escenarios de la sección 8 (cierre de
+las desviaciones D-1, D-2 y D-4) se implementaron como T229–T242. ~~Los escenarios de la sección 9 (VF-007,
+post-Baseline) son los únicos pendientes: sus tareas se generarán en la próxima ejecución de
+`/speckit-tasks` como un bloque post-Baseline separado, sin modificar T001–T242.~~ **[Actualizado — VF-004]**
+Los escenarios de la sección 9 (VF-007) se implementaron como T243–T266. ~~Los de la sección 10 (VF-004) son
+los únicos pendientes: sus tareas se generarán con `/speckit-tasks` como un bloque post-Baseline separado a
+partir de T287, sin modificar T001–T286.~~ Los de la sección 10 (VF-004) se implementaron como T287–T312, en
+un bloque post-Baseline separado y sin modificar T001–T286.
